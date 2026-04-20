@@ -1,0 +1,9 @@
+Host openclaw-vps
+    HostName 72.60.118.195
+    User fg
+    Port 4645
+    IdentityFile /home/dg/.ssh/openclaw_fg_72_60_118_195
+    IdentitiesOnly yes
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+    StrictHostKeyChecking accept-new

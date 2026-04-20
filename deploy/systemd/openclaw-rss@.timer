@@ -1,0 +1,11 @@
+[Unit]
+Description=Run OpenClaw RSS collector every 30 minutes (%i)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+Persistent=true
+Unit=openclaw-rss@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run OpenClaw post organizer every 10 minutes (%i)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+Persistent=true
+Unit=openclaw-post@%i.service
+
+[Install]
+WantedBy=timers.target

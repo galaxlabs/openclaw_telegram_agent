@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenClaw Telegram control bot (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fg
+WorkingDirectory=/home/fg/openclaw_telegram_agent
+EnvironmentFile=/etc/openclaw/%i.env
+ExecStart=/home/fg/openclaw_telegram_agent/.venv/bin/python control_bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

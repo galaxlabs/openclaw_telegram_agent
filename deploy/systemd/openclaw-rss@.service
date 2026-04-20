@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenClaw RSS collector (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=fg
+WorkingDirectory=/home/fg/openclaw_telegram_agent
+EnvironmentFile=/etc/openclaw/%i.env
+ExecStart=/home/fg/openclaw_telegram_agent/.venv/bin/python rss_collector.py

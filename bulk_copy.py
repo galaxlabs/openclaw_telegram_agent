@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 from telethon import TelegramClient
 import re
+from runtime_support import ensure_parent_dir, get_bulk_state_file, get_telethon_session_name
 
 URL_RE = re.compile(r"(https?://\S+)", re.IGNORECASE)
 
@@ -20,7 +21,8 @@ API_HASH = os.getenv("TELEGRAM_API_HASH", "dbffd181aa0a5bd040a806c410ee81a9")
 DEFAULT_SOURCE_CHAT_ID = int(os.getenv("BULK_SOURCE_CHAT_ID", "-1001220278770"))  # Technical
 DEFAULT_TARGET_CHAT_ID = int(os.getenv("BULK_TARGET_CHAT_ID", "-1003734446596"))  # IT Space
 
-STATE_FILE = os.getenv("BULK_STATE_FILE", "bulk_copy_state.json")
+STATE_FILE = get_bulk_state_file("bulk_copy_state.json")
+SESSION_NAME = get_telethon_session_name("telethon_session")
 
 def load_state():
     if not os.path.exists(STATE_FILE):
@@ -32,6 +34,7 @@ def load_state():
         return {}
 
 def save_state(state: dict):
+    ensure_parent_dir(STATE_FILE)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -44,7 +47,8 @@ async def main():
     if not API_ID or not API_HASH:
         raise SystemExit("Missing TELEGRAM_API_ID / TELEGRAM_API_HASH")
 
-    client = TelegramClient("telethon_session", API_ID, API_HASH)
+    ensure_parent_dir(SESSION_NAME)
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
     state = load_state()
     source_id = DEFAULT_SOURCE_CHAT_ID

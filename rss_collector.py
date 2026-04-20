@@ -9,10 +9,11 @@ from datetime import datetime, timezone
 
 import feedparser
 from dotenv import load_dotenv
+from runtime_support import ensure_items_schema, get_db_path
 
 load_dotenv()
 
-DB_PATH = os.getenv("DB_PATH", "agent.db")
+DB_PATH = get_db_path("agent.db")
 
 # Optional: put RSS URLs line-by-line in rss_feeds.txt
 FEEDS_FILE = os.getenv("RSS_FEEDS_FILE", "rss_feeds.txt")
@@ -174,6 +175,7 @@ def fetch_and_save_once():
         print("No RSS feeds found.")
         return
 
+    ensure_items_schema(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()

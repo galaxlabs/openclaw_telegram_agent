@@ -1,139 +1,232 @@
 import os
-import re
 import sqlite3
 import asyncio
+import sys
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from telegram import Bot
+from runtime_support import (
+    build_dedupe_signature,
+    ensure_items_schema,
+    find_existing_item_by_signature,
+    get_db_path,
+    parse_post_limit,
+)
+from publish_support import (
+    get_publish_config,
+    is_item_fully_processed,
+    make_post,
+    publish_to_website,
+)
 
 load_dotenv()
 
-DB = "agent.db"
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-SOURCE_CHAT_ID = os.getenv("TELEGRAM_SOURCE_CHAT_ID")  # kept for reference
-TARGET_CHAT_ID = os.getenv("TELEGRAM_TARGET_CHAT_ID")
+DB = get_db_path("agent.db")
 
-if not TOKEN or not TARGET_CHAT_ID:
-    raise SystemExit("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_TARGET_CHAT_ID in .env")
 
-URL_RE = re.compile(r"(https?://[^\s<>\]]+)", re.IGNORECASE)
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def domain_of(url: str) -> str:
-    try:
-        d = urlparse(url).netloc.lower()
-        return d.replace("www.", "")
-    except Exception:
-        return ""
-
-def clean_title(title: str, url: str) -> str:
-    t = (title or "").strip()
-    u = (url or "").strip()
-    t = URL_RE.sub("", t).strip()
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t:
-        d = domain_of(u)
-        return d if d else "(No title)"
-    return t[:160]
-
-def guess_type(url: str, title: str) -> str:
-    u = (url or "").lower()
-    t = (title or "").lower()
-    if "youtube.com" in u or "youtu.be" in u:
-        return "VIDEO"
-    if "github.com" in u:
-        return "GITHUB"
-    if any(x in u for x in ["medium.com", "dev.to", "towardsdatascience.com", "substack.com"]):
-        return "ARTICLE"
-    if any(x in u for x in ["twitter.com", "x.com", "threads.net", "instagram.com", "facebook.com"]):
-        return "SOCIAL"
-    if any(x in t for x in ["tutorial", "course", "guide", "how to"]):
-        return "TUTORIAL"
-    return "LINK"
-
-def clean_note(note: str | None, title_clean: str) -> str | None:
-    if not note:
-        return None
-    n = " ".join(note.strip().split())
-    n = URL_RE.sub("", n).strip()
-    n = re.sub(r"\s+", " ", n).strip()
-    if not n:
-        return None
-    if n.lower() == title_clean.lower():
-        return None
-    if len(n) > 200:
-        n = n[:200] + "…"
-    return n
-
-def make_post(title: str, url: str, note: str | None) -> str:
-    url = (url or "").strip()
-    d = domain_of(url)
-    title_clean = clean_title(title, url)
-    typ = guess_type(url, title_clean)
-    note_clean = clean_note(note, title_clean)
-
-    lines = []
-    # Telegram supports MarkdownV2; but to keep it simple, we use plain text.
-    lines.append(f"{title_clean}")
-    lines.append(f"Type: {typ} | Source: {d if d else 'unknown'}")
-    lines.append(url)
-    if note_clean:
-        lines.append("")
-        lines.append(f"Note: {note_clean}")
-    return "\n".join(lines)
 
 def fetch_unprocessed(limit: int):
     con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
     cur = con.cursor()
     rows = cur.execute("""
-        SELECT id, title, url, note, source_chat_id, source_message_id
+        SELECT
+            id,
+            title,
+            url,
+            note,
+            source_chat_id,
+            source_message_id,
+            source_date_utc,
+            website_published,
+            telegram_published,
+            source_deleted,
+            dedupe_signature,
+            duplicate_of_item_id
         FROM items
         WHERE processed=0 AND url IS NOT NULL
         ORDER BY (source_chat_id=0) ASC, id ASC
         LIMIT ?
     """, (limit,)).fetchall()
     con.close()
-    return rows
+    return [dict(r) for r in rows]
 
-def mark_processed(ids):
-    if not ids:
+def update_item_status(item_id: int, **fields):
+    if not fields:
         return
     con = sqlite3.connect(DB)
     cur = con.cursor()
-    now = datetime.now(timezone.utc).isoformat()
-    cur.executemany("UPDATE items SET processed=1, processed_at_utc=? WHERE id=?", [(now, i) for i in ids])
+    assignments = ", ".join(f"{col}=?" for col in fields)
+    values = list(fields.values()) + [item_id]
+    cur.execute(f"UPDATE items SET {assignments} WHERE id=?", values)
     con.commit()
     con.close()
 
+
+async def mark_duplicate_item(
+    *,
+    bot: Bot | None,
+    item: dict,
+    item_id: int,
+    signature: str,
+    duplicate_of_item_id: int,
+    delete_required: bool,
+):
+    fields = {
+        "dedupe_signature": signature,
+        "duplicate_of_item_id": duplicate_of_item_id,
+        "processed": 1,
+        "processed_at_utc": now_iso(),
+        "publish_error": "duplicate_skipped",
+    }
+
+    if delete_required and not item.get("source_deleted") and bot is not None:
+        await bot.delete_message(
+            chat_id=int(item["source_chat_id"]),
+            message_id=int(item["source_message_id"]),
+        )
+        fields["source_deleted"] = 1
+        fields["source_deleted_at_utc"] = now_iso()
+        item["source_deleted"] = 1
+        print(
+            "DELETED duplicate source message",
+            item["source_message_id"],
+            "from",
+            item["source_chat_id"],
+        )
+
+    update_item_status(item_id, **fields)
+    print("SKIPPED DUPLICATE item", item_id, "duplicate_of", duplicate_of_item_id)
+
 async def main(limit: int = 5):
+    ensure_items_schema(DB)
+    cfg = get_publish_config()
+    if not cfg["website_enabled"] and not cfg["telegram_enabled"]:
+        raise SystemExit(
+            "No publish target configured. Set TELEGRAM_TARGET_CHAT_ID or WEBSITE_PUBLISH_URL."
+        )
+
     rows = fetch_unprocessed(limit)
     if not rows:
         print("No unprocessed items to post.")
         return
 
-    bot = Bot(TOKEN)
-    done_ids = []
+    bot = None
+    if cfg["telegram_enabled"] or cfg["delete_enabled"]:
+        bot = Bot(cfg["bot_token"])
 
-    for item_id, title, url, note, src_chat_id, src_msg_id in rows:
-        text = make_post(title, url, note)
-        await bot.send_message(chat_id=TARGET_CHAT_ID, text=text, disable_web_page_preview=False)
-        print("POSTED item", item_id)
-        done_ids.append(item_id)
+    completed = 0
+    published_signatures: dict[str, int] = {}
 
+    for item in rows:
+        item_id = item["id"]
+        text = make_post(item["title"], item["url"], item["note"])
+        signature = item.get("dedupe_signature") or build_dedupe_signature(
+            item.get("title"),
+            item.get("url"),
+            item.get("note"),
+        )
         try:
-            if str(src_chat_id) != 0 and int(src_msg_id) > 0:
-                await bot.delete_message(
-                    chat_id=int(src_chat_id),
-                    message_id=int(src_msg_id)
+            delete_required = (
+                cfg["delete_enabled"]
+                and str(item["source_chat_id"]) != "0"
+                and int(item["source_message_id"]) > 0
+            )
+
+            duplicate_of_item_id = published_signatures.get(signature) or find_existing_item_by_signature(
+                DB,
+                signature,
+                exclude_item_id=item_id,
+                require_published=True,
+            )
+            if duplicate_of_item_id:
+                await mark_duplicate_item(
+                    bot=bot,
+                    item=item,
+                    item_id=item_id,
+                    signature=signature,
+                    duplicate_of_item_id=duplicate_of_item_id,
+                    delete_required=delete_required,
                 )
-                print("DELETED source message", src_msg_id, "from", src_chat_id)
+                continue
+
+            if item.get("dedupe_signature") != signature:
+                update_item_status(item_id, dedupe_signature=signature)
+
+            if cfg["website_enabled"] and not item.get("website_published"):
+                publish_to_website(item, text)
+                update_item_status(
+                    item_id,
+                    website_published=1,
+                    website_published_at_utc=now_iso(),
+                    dedupe_signature=signature,
+                    publish_error=None,
+                )
+                item["website_published"] = 1
+                print("WEBSITE PUBLISHED item", item_id)
+
+            if cfg["telegram_enabled"] and not item.get("telegram_published"):
+                await bot.send_message(
+                    chat_id=cfg["target_chat_id"],
+                    text=text,
+                    disable_web_page_preview=False,
+                )
+                update_item_status(
+                    item_id,
+                    telegram_published=1,
+                    telegram_published_at_utc=now_iso(),
+                    dedupe_signature=signature,
+                    publish_error=None,
+                )
+                item["telegram_published"] = 1
+                print("TELEGRAM POSTED item", item_id)
+
+            if delete_required and not item.get("source_deleted"):
+                await bot.delete_message(
+                    chat_id=int(item["source_chat_id"]),
+                    message_id=int(item["source_message_id"]),
+                )
+                update_item_status(
+                    item_id,
+                    source_deleted=1,
+                    source_deleted_at_utc=now_iso(),
+                    dedupe_signature=signature,
+                    publish_error=None,
+                )
+                item["source_deleted"] = 1
+                print(
+                    "DELETED source message",
+                    item["source_message_id"],
+                    "from",
+                    item["source_chat_id"],
+                )
+
+            if is_item_fully_processed(
+                item=item,
+                website_enabled=cfg["website_enabled"],
+                telegram_enabled=cfg["telegram_enabled"],
+                delete_enabled=delete_required,
+            ):
+                update_item_status(
+                    item_id,
+                    processed=1,
+                    processed_at_utc=now_iso(),
+                    dedupe_signature=signature,
+                    publish_error=None,
+                )
+                completed += 1
+                published_signatures[signature] = item_id
+                print("MARKED PROCESSED item", item_id)
         except Exception as e:
-            print("WARN: could not delete source message:", e)
+            err = str(e)[:1000]
+            update_item_status(item_id, publish_error=err)
+            print("WARN: item failed", item_id, err)
 
-
-    mark_processed(done_ids)
-    print("Marked processed:", len(done_ids))
+    print("Marked processed:", completed)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main(limit=parse_post_limit(sys.argv[1:])))

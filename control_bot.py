@@ -8,12 +8,13 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from runtime_support import ensure_items_schema, ensure_parent_dir, get_control_path, get_db_path
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DB_PATH = os.getenv("DB_PATH", "agent.db")
-CONTROL_PATH = os.getenv("CONTROL_PATH", "control.json")
+BOT_TOKEN = os.getenv("CONTROL_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+DB_PATH = get_db_path("agent.db")
+CONTROL_PATH = get_control_path("control.json")
 
 if not BOT_TOKEN:
     raise SystemExit("Missing TELEGRAM_BOT_TOKEN in .env")
@@ -28,6 +29,7 @@ def load_control():
         return json.load(f)
 
 def save_control(data):
+    ensure_parent_dir(CONTROL_PATH)
     with open(CONTROL_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -54,6 +56,7 @@ def build_panel_keyboard():
 
 def db_stats():
     # very safe stats: count unprocessed + total
+    ensure_items_schema(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
@@ -165,7 +168,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(text, reply_markup=build_panel_keyboard())
         return
 
-async def main():
+def main():
+    ensure_items_schema(DB_PATH)
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("panel", cmd_panel))
@@ -177,8 +181,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(on_button))
 
     print("Control bot started. Use /panel in your group.")
-    await app.run_polling(close_loop=False)
+    app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
